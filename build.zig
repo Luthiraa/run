@@ -52,7 +52,7 @@ const Budget = struct {
         const b = step.owner;
         const binary = try std.Io.Dir.cwd().statFile(b.graph.io, self.binary.getPath2(b, step), .{});
         var total = binary.size;
-        for ([_][]const u8{ "run.zig", "build.zig", "build.zig.zon", "README.md", "SYSTEM.md", ".gitignore" }) |path| {
+        for ([_][]const u8{ "run.zig", "build.zig", "build.zig.zon", "README.md", ".gitignore" }) |path| {
             total += (try std.Io.Dir.cwd().statFile(b.graph.io, b.pathFromRoot(path), .{})).size;
         }
         std.debug.print("run: {d} byte executable; {d} bytes with core source and docs\n", .{ binary.size, total });
