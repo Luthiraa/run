@@ -352,7 +352,7 @@ fn used(vm: *Vm, q: *Vq, id: u16, len: u32) !void {
 }
 
 fn kick(vm: *Vm, d: *Vdev, qn: u32) !void {
-    if (qn >= (if (d.kind == .blk) @as(u32, 1) else 2) or d.status & 4 == 0) return error.Vq;
+    if (qn >= (if (d.kind == .blk) @as(u32, 1) else 2) or d.status & 0x8c != 0x0c) return error.Vq;
     const q = &d.q[qn];
     if (q.ready == 0 or q.num == 0) return;
     const avail = try gp(vm, q.avail, 4 + @as(usize, q.num) * 2);
@@ -533,12 +533,12 @@ fn mmio(vm: *Vm, d: *Vdev, off: u64, data: []u8, write: bool) void {
 
 fn cfg(vm: *Vm, d: *Vdev, off: u64) u64 {
     return switch (d.kind) {
-        .blk => switch (off) {
-            0 => vm.cow.size() / 512,
-            4 => (vm.cow.size() / 512) >> 32,
-            8 => 65536,
-            12 => 62,
-            else => 0,
+        .blk => blk: {
+            var bytes: [24]u8 = @splat(0);
+            wle(u64, &bytes, vm.cow.size() / 512);
+            wle(u32, bytes[8..], 65536);
+            wle(u32, bytes[12..], 62);
+            break :blk if (off < 16) le(u64, bytes[@intCast(off)..]) else 0;
         },
         .net => if (off < 6) le(u64, &(vm.mac ++ [_]u8{ 0, 0 })) >> @as(u6, @intCast(off * 8)) else 0,
     };
@@ -557,6 +557,7 @@ const Uart = struct {
     cons: []u8 = &.{},
     clen: usize = 0,
     tx_pending: bool = false,
+    scratch: u8 = 0,
 
     fn irq(u: *Uart) u8 {
         return if (u.ier & 1 != 0 and u.r != u.w) 4 else if (u.ier & 2 != 0 and u.tx_pending) 2 else 1;
@@ -589,12 +590,13 @@ const Uart = struct {
                 },
                 1 => {
                     if (u.lcr & 0x80 != 0) u.dlm = v else {
-                        u.ier = v;
+                        u.ier = v & 15;
                         u.tx_pending = true;
                     }
                 },
                 3 => u.lcr = v,
                 4 => u.mcr = v,
+                7 => u.scratch = v,
                 else => {},
             }
         } else {
@@ -605,7 +607,8 @@ const Uart = struct {
                 3 => u.lcr,
                 4 => u.mcr,
                 5 => 0x60 | @as(u8, if (u.r != u.w) 1 else 0),
-                6 => 0xb0,
+                6 => if (u.mcr & 16 != 0) ((u.mcr & 1) << 5) | ((u.mcr & 2) << 3) | ((u.mcr & 12) << 4) else 0xb0,
+                7 => u.scratch,
                 else => 0,
             };
             if (p == 2 and data[0] == 2) u.tx_pending = false;
@@ -1650,4 +1653,46 @@ test "vCPU topology uses distinct APIC IDs and a single package" {
     try std.testing.expectEqual(@as(u32, 3), entries[1].edx);
     try std.testing.expectEqual(@as(u32, 4), entries[2].ebx);
     try std.testing.expectEqual(@as(u32, 2), entries[2].eax);
+}
+
+test "egress grants reject spoofing, fragments, IPv6 and ungranted ports" {
+    const p = try Policy.parse("tcp:10.0.0.1/32:8000,udp:1.1.1.1:53");
+    const mac = [_]u8{ 0x52, 0x54, 0, 0x12, 0x34, 0 };
+    var frame: [54]u8 = @splat(0);
+    @memcpy(frame[6..12], &mac);
+    frame[12] = 8;
+    frame[14] = 0x45;
+    frame[17] = 40;
+    frame[23] = 6;
+    @memcpy(frame[26..30], &[_]u8{ 10, 0, 0, 2 });
+    @memcpy(frame[30..34], &[_]u8{ 10, 0, 0, 1 });
+    std.mem.writeInt(u16, frame[36..38], 8000, .big);
+    try std.testing.expect(p.permits(&frame, 0, mac));
+    const revoked: Policy = .{};
+    try std.testing.expect(!revoked.permits(&frame, 0, mac));
+    for ([_]usize{ 6, 12, 20, 26, 30, 37 }) |i| {
+        frame[i] ^= 1;
+        try std.testing.expect(!p.permits(&frame, 0, mac));
+        frame[i] ^= 1;
+    }
+    for (0..frame.len) |n| try std.testing.expect(!p.permits(frame[0..n], 0, mac));
+    for ([_][]const u8{ "tcp:1.1.1.1/33:80", "udp:300.0.0.1:53", "tcp:1.1.1.1:65536", "icmp:1.1.1.1:80", "tcp:1.1.1.1:80," }) |s| {
+        if (Policy.parse(s)) |_| return error.AcceptedInvalidPolicy else |_| {}
+    }
+}
+
+test "UART input IRQ acknowledgement and byte-addressed block capacity" {
+    var uart: Uart = .{};
+    uart.ier = 1;
+    uart.put('x');
+    try std.testing.expectEqual(@as(u8, 4), uart.irq());
+    var byte: [1]u8 = undefined;
+    uart.io(0x3f8, &byte, false, -1);
+    try std.testing.expectEqual(@as(u8, 'x'), byte[0]);
+    try std.testing.expectEqual(@as(u8, 1), uart.irq());
+    var vm: Vm = .{ .id = 0, .gpa = std.testing.allocator, .cow = .{ .gpa = std.testing.allocator, .base = try mmapAnon(1 << 20) } };
+    defer vm.cow.deinit();
+    var capacity: [8]u8 = undefined;
+    for (&capacity, 0..) |*b, i| b.* = @truncate(cfg(&vm, &vm.blk, i));
+    try std.testing.expectEqual(@as(u64, 2048), le(u64, &capacity));
 }

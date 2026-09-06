@@ -4,6 +4,8 @@ Run as root on an x86-64 Linux test host with busybox-static, cpio and a kernel.
 import hashlib
 import json
 import pathlib
+import os
+import stat
 import shutil
 import subprocess as sp
 import tempfile
@@ -36,6 +38,8 @@ def main():
             (root / name).mkdir(parents=True, exist_ok=True)
         shutil.copy2("/bin/busybox", root / "bin/busybox")
         (root / "bin/sh").symlink_to("busybox")
+        os.mknod(root / "dev/console", stat.S_IFCHR | 0o600, os.makedev(5, 1))
+        os.mknod(root / "dev/null", stat.S_IFCHR | 0o666, os.makedev(1, 3))
         for module in ("virtio_mmio", "virtio_blk", "virtio_net", "ext4"):
             deps = sp.check_output(["modprobe", "-S", version, "--show-depends", module], text=True)
             for line in deps.splitlines():
@@ -48,14 +52,19 @@ def main():
                         command({".zst": "zstd", ".xz": "xz", ".gz": "gzip"}[source.suffix], "-dc", str(source), stdout=out)
                 else:
                     shutil.copy2(source, dest)
+        for name in ("modules.builtin", "modules.builtin.modinfo", "modules.order"):
+            source = pathlib.Path("/lib/modules") / version / name
+            if source.exists():
+                shutil.copy2(source, root / "lib/modules" / version / name)
         command("depmod", "-b", str(root), version)
         (root / "init").write_text('''#!/bin/sh
+export PATH=/bin
 /bin/busybox --install -s /bin
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
 exec </dev/console >/dev/console 2>&1
-set -e
+set -ex
 modprobe virtio_mmio
 modprobe virtio_blk
 modprobe virtio_net
