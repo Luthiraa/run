@@ -4,3 +4,5 @@ zig-out/
 *.o
 *.img
 *.snap
+__pycache__/
+evidence/

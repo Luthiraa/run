@@ -1032,6 +1032,10 @@ fn runCpu(cpu: *Vcpu) void {
         const rc = linux.ioctl(cpu.fd, KVM_RUN, 0);
         const e = linux.errno(rc);
         if (e == .INTR) continue;
+        if (e == .AGAIN) { // An AP can still be waiting for INIT/SIPI.
+            _ = linux.sched_yield();
+            continue;
+        }
         if (e != .SUCCESS) {
             log("vm{d}: KVM_RUN errno {d}\n", .{ cpu.vm.id, @intFromEnum(e) });
             break;
@@ -1250,7 +1254,9 @@ fn route(cl: *Cloud, cfd: i32, req: []const u8) !void {
         return reply(cfd, "200 OK", out[0..n]);
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/vms")) {
-        const policy = try Policy.parse(kv(args, "allow") orelse "");
+        const grants = try kvz(cl.gpa, args, "allow", "");
+        defer cl.gpa.free(grants);
+        const policy = try Policy.parse(grants);
         if (kvu(args, "net", 0) > 1) return error.VmConfig;
         if (kvu(args, "cpus", 1) == 0 or kvu(args, "cpus", 1) > MAX_CPU or kvu(args, "mem", 512) < 16 or kvu(args, "mem", 512) > RAM_MAX >> 20) return error.VmConfig;
         const slot = for (cl.used, 0..) |u, i| {
