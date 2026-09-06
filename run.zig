@@ -472,7 +472,7 @@ fn mmio(vm: *Vm, d: *Vdev, off: u64, data: []u8, write: bool) void {
         const v: u64 = switch (off) {
             0x00 => 0x74726976,
             0x04 => 2,
-            0x08 => if (d.kind == .blk) 2 else 1,
+            0x08 => if (d.kind == .blk) (if (vm.cow.size() != 0) @as(u32, 2) else 0) else (if (vm.tap >= 0) @as(u32, 1) else 0),
             0x0c => 0x4d434c44,
             0x10 => if (d.feat_sel < 2) @as(u32, @truncate(hostFeat(d.kind) >> @as(u6, @intCast(d.feat_sel * 32)))) else 0,
             0x34 => if (valid) 256 else 0,
@@ -682,8 +682,21 @@ fn plantAcpi(ram: []u8, ncpu: u32) u64 {
     wle(u32, madt[o + 4 ..][0..4], 2);
     csum(madt, 9);
 
-    const dsdt = p[dsdt_off..][0..36];
-    acpiHdr(dsdt, "DSDT", 36, 2);
+    const dsdt = p[dsdt_off..][0..166];
+    acpiHdr(dsdt, "DSDT", 166, 2);
+    // Scope (\\_SB): two LNRO0005 devices, fixed MMIO and level-high GSI resources.
+    @memcpy(dsdt[36..44], "\x10\x41\x08\\_SB_");
+    const device = "\x5b\x82\x3bVBLK\x08_HID\x0dLNRO0005\x00\x08_UID\x0a\x00" ++
+        "\x08_CRS\x11\x1a\x0a\x17\x86\x09\x00\x01" ++
+        "\x00\x00\x00\x00\x00\x10\x00\x00\x89\x06\x00\x01\x01\x00\x00\x00\x00\x79\x00";
+    for (0..2) |i| {
+        const node = dsdt[44 + i * 61 ..][0..61];
+        @memcpy(node, device);
+        if (i == 1) @memcpy(node[3..7], "VNET");
+        node[28] = @intCast(i);
+        wle(u32, node[42..46], @intCast(BLK_BASE + i * PAGE));
+        wle(u32, node[55..59], @intCast(5 + i));
+    }
     csum(dsdt, 9);
 
     const xsdt = p[xsdt_off..][0..52];
@@ -1079,9 +1092,8 @@ fn startVm(vm: *Vm) !void {
 
     var cmd_buf: [512]u8 = undefined;
     var net_buf: [128]u8 = undefined;
-    const net_cmd = if (vm.tap >= 0) try std.fmt.bufPrint(&net_buf, " virtio_mmio.device=4K@0xd0001000:6 ip=10.0.{d}.2::10.0.{d}.1:255.255.255.0::eth0:off", .{ vm.id, vm.id }) else "";
-    const cmd = try std.fmt.bufPrint(&cmd_buf, "console=ttyS0 earlyprintk=serial,ttyS0,115200 reboot=t panic=1 pci=off tsc=reliable{s}{s}{s} {s}", .{
-        if (vm.disk.len != 0) " virtio_mmio.device=4K@0xd0000000:5" else "",
+    const net_cmd = if (vm.tap >= 0) try std.fmt.bufPrint(&net_buf, " ip=10.0.{d}.2::10.0.{d}.1:255.255.255.0::eth0:off", .{ vm.id, vm.id }) else "";
+    const cmd = try std.fmt.bufPrint(&cmd_buf, "console=ttyS0 earlyprintk=serial,ttyS0,115200 reboot=t panic=1 pci=off tsc=reliable{s}{s} {s}", .{
         net_cmd,
         if (vm.ncpu > 1) " acpi=force" else "",
         vm.extra,
