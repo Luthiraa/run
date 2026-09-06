@@ -103,11 +103,9 @@ curl -X POST http://127.0.0.1:8080/vms/0/start
 
 ## Validation
 
-[Real KVM CI](https://github.com/Luthiraa/run/actions/workflows/kvm.yml) boots
-an unmodified Ubuntu kernel into two-CPU userspace, executes serial commands,
-checks routed networking and permission revocation, writes to a private disk,
-and restores a checkpoint.
+The [KVM workflow](.github/workflows/kvm.yml) is visible in the repository and
+runs on a GitHub Ubuntu host with `/dev/kvm`. Its [latest runs](https://github.com/Luthiraa/run/actions/workflows/kvm.yml)
+build the binary and run the test suite.
 
-The [system guide](SYSTEM.md) explains the device model, operating model, and
-security boundaries. The [validation record](docs/validation.md) contains the
-serial log and measured test results.
+For the device model and operating boundaries, read the source alongside the
+small command-line surface above.

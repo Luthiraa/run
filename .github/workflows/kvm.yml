@@ -1,0 +1,26 @@
+name: KVM
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test on a KVM host
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Zig
+        run: |
+          curl -fsSL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o /tmp/zig.tar.xz
+          tar -C /tmp -xf /tmp/zig.tar.xz
+          echo /tmp/zig-x86_64-linux-0.16.0 >> "$GITHUB_PATH"
+      - name: Build and test
+        run: |
+          test -c /dev/kvm
+          zig build
+          zig build test
