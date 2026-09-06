@@ -654,7 +654,7 @@ fn plantAcpi(ram: []u8, ncpu: u32) u64 {
     acpiHdr(fadt, "FACP", 276, 6);
     wle(u32, fadt[40..44], @intCast(base + dsdt_off));
     wle(u16, fadt[109..111], 4 | 8 | 32);
-    wle(u32, fadt[112..116], (1 << 10) | (1 << 20));
+    wle(u32, fadt[112..116], 1 << 20);
     wle(u64, fadt[140..148], base + dsdt_off);
     csum(fadt, 9);
 
@@ -682,10 +682,10 @@ fn plantAcpi(ram: []u8, ncpu: u32) u64 {
     wle(u32, madt[o + 4 ..][0..4], 2);
     csum(madt, 9);
 
-    const dsdt = p[dsdt_off..][0..166];
-    acpiHdr(dsdt, "DSDT", 166, 2);
+    const dsdt = p[dsdt_off..][0..205];
+    acpiHdr(dsdt, "DSDT", 205, 2);
     // Scope (\\_SB): two LNRO0005 devices, fixed MMIO and level-high GSI resources.
-    @memcpy(dsdt[36..44], "\x10\x41\x08\\_SB_");
+    @memcpy(dsdt[36..44], "\x10\x48\x0a\\_SB_");
     const device = "\x5b\x82\x3bVBLK\x08_HID\x0dLNRO0005\x00\x08_UID\x0a\x00" ++
         "\x08_CRS\x11\x1a\x0a\x17\x86\x09\x00\x01" ++
         "\x00\x00\x00\x00\x00\x10\x00\x00\x89\x06\x00\x01\x01\x00\x00\x00\x00\x79\x00";
@@ -697,6 +697,9 @@ fn plantAcpi(ram: []u8, ncpu: u32) u64 {
         wle(u32, node[42..46], @intCast(BLK_BASE + i * PAGE));
         wle(u32, node[55..59], @intCast(5 + i));
     }
+    // A reduced-hardware FADT needs explicit UART resources, too.
+    @memcpy(dsdt[166..205], "\x5b\x82\x25COM1\x08_HID\x0dPNP0501\x00" ++
+        "\x08_CRS\x11\x0c\x0a\x09\x4b\xf8\x03\x08\x22\x10\x00\x79\x00");
     csum(dsdt, 9);
 
     const xsdt = p[xsdt_off..][0..52];
@@ -848,7 +851,7 @@ const Policy = struct {
         const ip = frame[14..];
         const hlen = @as(usize, ip[0] & 15) * 4;
         const length = std.mem.readInt(u16, ip[2..4], .big);
-        if (ip[0] >> 4 != 4 or hlen < 20 or length < hlen or length > ip.len or
+        if (ip[0] >> 4 != 4 or hlen != 20 or length < hlen or length > ip.len or
             std.mem.readInt(u16, ip[6..8], .big) & 0x3fff != 0 or std.mem.readInt(u32, ip[12..16], .big) != guest) return false;
         const protocol = ip[9];
         if (length - hlen < (if (protocol == 6) @as(usize, 20) else 8)) return false;
