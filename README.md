@@ -1,7 +1,7 @@
 
 
 
-<img width="150" alt="ChatGPT Image Sep 6, 2026, 12_21_31 PM (1)" src="https://github.com/user-attachments/assets/28174469-7570-40ba-89ae-3f627559ac4f" />
+<img width="150" alt="run-logo-cropped" src="https://github.com/user-attachments/assets/9f0795a9-748b-4491-85b4-a8b22ba3b51e" />
 
 
 # run
