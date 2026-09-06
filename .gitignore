@@ -6,3 +6,4 @@ zig-out/
 *.snap
 __pycache__/
 evidence/
+tests/
