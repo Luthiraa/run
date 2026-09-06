@@ -6,19 +6,22 @@
 
 # run
 
-Linux in a process.
+Linux. In a process.
 
-One static binary. KVM, virtio, copy-on-write disks, explicit network
-grants. No libc. No daemons. No cluster.
+One static binary. KVM. virtio. private disks. explicit egress.
+
+No libc. No daemons. No cluster. Just the machine.
 
 ```sh
 zig build
 ./zig-out/bin/run --disk root.img --cmdline 'root=/dev/vda rw' bzImage
 ```
 
-Zig 0.16. x86-64 Linux. `/dev/kvm`.
+Zig 0.16 · x86-64 Linux · `/dev/kvm`
 
-## Usage
+> Tiny enough to read. Real enough to boot an unmodified Ubuntu kernel.
+
+## Start
 
 ```
 run [options] [kernel]
@@ -34,23 +37,24 @@ run [options] [kernel]
   --allow RULES    tcp|udp|icmp:ip/prefix:port
 ```
 
-No kernel argument: just the API.
+No kernel? You get the API.
 
-## Network
+## Network is a permission
 
-Off. You grant destinations.
+Off by default. The guest gets only what you name.
 
 ```sh
 sudo ./zig-out/bin/run --allow 'tcp:1.2.3.4:443' --disk root.img bzImage
 sudo sh tools/egress.sh up 0 eth0
 ```
 
-VM `N` → TAP `runN`, guest `10.0.N.2`, gateway `10.0.N.1`.
-Everything else is dropped.
+`runN` → `10.0.N.2` → `10.0.N.1`.
 
-## Disks
+Everything else drops. Every packet is checked. Empty permissions revoke egress.
 
-The base is mapped private. Guest writes never touch it.
+## Disks are private
+
+The base image is mapped `MAP_PRIVATE`. Guest writes never touch it.
 
 ```sh
 curl -X POST http://127.0.0.1:8080/vms/0/snap
@@ -59,19 +63,19 @@ curl -X POST http://127.0.0.1:8080/vms/0/snap
 
 Same base. Disk delta. Not a live snapshot.
 
-## Commands
+## Commands, not agents
 
-Guest needs a shell on `ttyS0`.
+Give the guest a shell on `ttyS0`.
 
 ```sh
 python3 tools/agent.py --vm 0 'uname -a'
 ```
 
-Returns `stdout` and `exit_code`.
+Get `stdout` and `exit_code`. No guest daemon required.
 
-## API
+## Local API
 
-Localhost. No auth. Don't proxy it.
+Localhost only. No auth. Don't proxy it.
 
 ```
 POST   /vms
@@ -93,3 +97,14 @@ curl --data-urlencode kernel=/images/bzImage \
      -d 'cpus=2&mem=256' http://127.0.0.1:8080/vms
 curl -X POST http://127.0.0.1:8080/vms/0/start
 ```
+
+## Proof, not posture
+
+[Real KVM CI](https://github.com/Luthiraa/run/actions/workflows/kvm.yml) boots
+an unmodified Ubuntu kernel into two-CPU userspace, runs commands, routes and
+revokes network access, writes a private disk, and restores a checkpoint.
+
+Read [the system guide](SYSTEM.md). Read [the validation record](docs/validation.md).
+
+`run` is a tiny VMM. It is not a public cloud, a container runtime, or a
+hostile multi-tenant boundary.
