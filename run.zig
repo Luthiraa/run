@@ -64,6 +64,7 @@ fn errorText(err: anyerror) []const u8 {
         error.Ram, error.BootConfig, error.VmConfig => "invalid CPU, memory or kernel configuration",
         error.OutOfMemory => "out of memory",
         error.Down => "VM is stopped",
+        error.Policy => "invalid network grant; use tcp|udp|icmp:IPv4/prefix:port (0 means any port)",
         else => "operation failed",
     };
 }
@@ -431,7 +432,9 @@ fn doTx(vm: *Vm, iov: [][]u8) !u32 {
     for (iov) |s| total += s.len;
     if (total < 12 or total > pkt.len) return error.Vq;
     const n = gather(iov, &pkt);
-    if (n > 12 and vm.tap >= 0) wr(vm.tap, pkt[12..n]);
+    if (n > 12 and vm.tap >= 0) {
+        if (vm.policy.permits(pkt[12..n], vm.id, vm.mac)) wr(vm.tap, pkt[12..n]) else vm.denied +%= 1;
+    }
     return 0;
 }
 
@@ -553,6 +556,11 @@ const Uart = struct {
     w: u8 = 0,
     cons: []u8 = &.{},
     clen: usize = 0,
+    tx_pending: bool = false,
+
+    fn irq(u: *Uart) u8 {
+        return if (u.ier & 1 != 0 and u.r != u.w) 4 else if (u.ier & 2 != 0 and u.tx_pending) 2 else 1;
+    }
 
     fn put(u: *Uart, c: u8) void {
         u.rx[u.w] = c;
@@ -573,13 +581,17 @@ const Uart = struct {
                     u.dll = v;
                 } else {
                     wr(out, data[0..1]);
-                    if (u.clen < u.cons.len) {
-                        u.cons[u.clen] = v;
+                    u.tx_pending = true;
+                    if (u.cons.len != 0) {
+                        u.cons[u.clen % u.cons.len] = v;
                         u.clen += 1;
                     }
                 },
                 1 => {
-                    if (u.lcr & 0x80 != 0) u.dlm = v else u.ier = v;
+                    if (u.lcr & 0x80 != 0) u.dlm = v else {
+                        u.ier = v;
+                        u.tx_pending = true;
+                    }
                 },
                 3 => u.lcr = v,
                 4 => u.mcr = v,
@@ -589,13 +601,14 @@ const Uart = struct {
             data[0] = switch (p) {
                 0 => if (u.lcr & 0x80 != 0) u.dll else u.pop(),
                 1 => if (u.lcr & 0x80 != 0) u.dlm else u.ier,
-                2 => 0x01,
+                2 => u.irq(),
                 3 => u.lcr,
                 4 => u.mcr,
                 5 => 0x60 | @as(u8, if (u.r != u.w) 1 else 0),
                 6 => 0xb0,
                 else => 0,
             };
+            if (p == 2 and data[0] == 2) u.tx_pending = false;
         }
     }
 };
@@ -774,6 +787,63 @@ fn seg(sel: u16, typ: u8, l: u8, db: u8) Seg {
     return .{ .base = 0, .limit = 0xfffff, .selector = sel, .type = typ, .present = 1, .dpl = 0, .db = db, .s = 1, .l = l, .g = 1, .avl = 0, .unusable = 0, .pad = 0 };
 }
 
+// Outbound IPv4 grants. No VLAN, IPv6, fragments or spoofed sources cross TAP.
+const Policy = struct {
+    const Rule = struct { address: u32, mask: u32, port: u16, protocol: u8 };
+    rules: [16]Rule = undefined,
+    count: usize = 0,
+
+    fn ipv4(text: []const u8) !u32 {
+        var parts = std.mem.splitScalar(u8, text, '.');
+        var address: u32 = 0;
+        for (0..4) |_| address = (address << 8) | try std.fmt.parseInt(u8, parts.next() orelse return error.Policy, 10);
+        if (parts.next() != null) return error.Policy;
+        return address;
+    }
+    fn parse(text: []const u8) !Policy {
+        var p: Policy = .{};
+        if (text.len == 0) return p;
+        var entries = std.mem.splitScalar(u8, text, ',');
+        while (entries.next()) |entry| {
+            if (p.count == p.rules.len) return error.Policy;
+            var fields = std.mem.splitScalar(u8, entry, ':');
+            const proto = fields.next() orelse return error.Policy;
+            var cidr = std.mem.splitScalar(u8, fields.next() orelse return error.Policy, '/');
+            const address = try ipv4(cidr.next() orelse return error.Policy);
+            const bits = try std.fmt.parseInt(u6, cidr.next() orelse "32", 10);
+            const port = try std.fmt.parseInt(u16, fields.next() orelse return error.Policy, 10);
+            if (bits > 32 or fields.next() != null or cidr.next() != null) return error.Policy;
+            const protocol: u8 = if (std.mem.eql(u8, proto, "tcp")) 6 else if (std.mem.eql(u8, proto, "udp")) 17 else if (std.mem.eql(u8, proto, "icmp") and port == 0) 1 else return error.Policy;
+            p.rules[p.count] = .{ .address = address, .mask = if (bits == 0) 0 else @as(u32, std.math.maxInt(u32)) << @as(u5, @intCast(32 - bits)), .port = port, .protocol = protocol };
+            p.count += 1;
+        }
+        return p;
+    }
+    fn permits(p: *const Policy, frame: []const u8, id: u32, mac: [6]u8) bool {
+        if (frame.len < 14 or !std.mem.eql(u8, frame[6..12], &mac)) return false;
+        const guest = 0x0a000002 | (id << 8);
+        const ether = std.mem.readInt(u16, frame[12..14], .big);
+        if (ether == 0x0806) {
+            return frame.len >= 42 and std.mem.eql(u8, frame[14..20], &.{ 0, 1, 8, 0, 6, 4 }) and
+                (frame[20] == 0 and (frame[21] == 1 or frame[21] == 2)) and std.mem.eql(u8, frame[22..28], &mac) and
+                std.mem.readInt(u32, frame[28..32], .big) == guest and std.mem.readInt(u32, frame[38..42], .big) == guest - 1;
+        }
+        if (ether != 0x0800 or frame.len < 34) return false;
+        const ip = frame[14..];
+        const hlen = @as(usize, ip[0] & 15) * 4;
+        const length = std.mem.readInt(u16, ip[2..4], .big);
+        if (ip[0] >> 4 != 4 or hlen < 20 or length < hlen or length > ip.len or
+            std.mem.readInt(u16, ip[6..8], .big) & 0x3fff != 0 or std.mem.readInt(u32, ip[12..16], .big) != guest) return false;
+        const protocol = ip[9];
+        if (length - hlen < (if (protocol == 6) @as(usize, 20) else 8)) return false;
+        if (protocol != 1 and protocol != 6 and protocol != 17) return false;
+        const port = if (protocol == 1) 0 else std.mem.readInt(u16, ip[hlen + 2 ..][0..2], .big);
+        const destination = std.mem.readInt(u32, ip[16..20], .big);
+        for (p.rules[0..p.count]) |r| if (r.protocol == protocol and destination & r.mask == r.address & r.mask and (r.port == 0 or r.port == port)) return true;
+        return false;
+    }
+};
+
 // ── VM ─────────────────────────────────────────────────────────────────────
 const Vcpu = struct { vm: *Vm, id: u32, fd: i32 = -1, run: *Run = undefined, mapped: usize = 0 };
 const Vm = struct {
@@ -800,7 +870,9 @@ const Vm = struct {
     extra: [:0]const u8 = "",
     overlay: [:0]const u8 = "",
     strings: ?std.heap.ArenaAllocator = null,
-    want_net: bool = true,
+    want_net: bool = false,
+    policy: Policy = .{},
+    denied: u64 = 0,
 };
 
 fn sandbox() !void {
@@ -824,31 +896,24 @@ fn sandbox() !void {
     _ = try sys(linux.seccomp(linux.SECCOMP.SET_MODE_FILTER, 0, &p));
 }
 
-fn tapdev(id: u32, mac: *[6]u8) i32 {
+fn tapdev(id: u32, mac: *[6]u8) !i32 {
     mac[5] = @truncate(id);
-    const tap = fdopen("/dev/net/tun", .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NONBLOCK = true }) catch return -1;
+    const tap = try fdopen("/dev/net/tun", .{ .ACCMODE = .RDWR, .CLOEXEC = true, .NONBLOCK = true });
+    errdefer _ = linux.close(tap);
     var ifr: [40]u8 = @splat(0);
-    const nm = std.fmt.bufPrint(ifr[0..16], "mc{d}", .{id}) catch return -1;
-    _ = nm;
-    wle(u16, ifr[16..18], 0x0002 | 0x1000); // IFF_TAP | IFF_NO_PI
-    const TUNSETIFF = IOCTL.IOW('T', 202, i32);
-    if (linux.errno(linux.ioctl(tap, TUNSETIFF, @intFromPtr(&ifr))) != .SUCCESS) {
-        _ = linux.close(tap);
-        return -1;
-    }
-    const sk: i32 = @intCast(linux.socket(linux.AF.INET, linux.SOCK.DGRAM, 0));
-    if (sk < 0) return tap;
-    wle(u16, ifr[16..18], 0x0001 | 0x0040); // UP | RUNNING
-    _ = linux.ioctl(sk, 0x8914, @intFromPtr(&ifr)); // SIOCSIFFLAGS
-    var sa: [16]u8 = @splat(0);
-    wle(u16, sa[0..2], linux.AF.INET);
-    wle(u32, sa[4..8], 0x0100000a | (id << 16)); // 10.0.<id>.1
-    @memcpy(ifr[16..32], &sa);
-    _ = linux.ioctl(sk, 0x8916, @intFromPtr(&ifr)); // SIOCSIFADDR
-    wle(u32, sa[4..8], 0x00ffffff);
-    @memcpy(ifr[16..32], &sa);
-    _ = linux.ioctl(sk, 0x891c, @intFromPtr(&ifr)); // SIOCSIFNETMASK
-    _ = linux.close(sk);
+    _ = try std.fmt.bufPrint(ifr[0..16], "run{d}", .{id});
+    wle(u16, ifr[16..18], 0x0002 | 0x1000 | 0x8000); // TAP | NO_PI | TUN_EXCL
+    try io(tap, IOCTL.IOW('T', 202, i32), @intFromPtr(&ifr));
+    const sk: i32 = @intCast(try sys(linux.socket(linux.AF.INET, linux.SOCK.DGRAM | linux.SOCK.CLOEXEC, 0)));
+    defer _ = linux.close(sk);
+    wle(u16, ifr[16..18], 1); // UP
+    try io(sk, 0x8914, @intFromPtr(&ifr));
+    @memset(ifr[16..], 0);
+    wle(u16, ifr[16..18], linux.AF.INET);
+    wle(u32, ifr[20..24], 0x0100000a | (id << 16));
+    try io(sk, 0x8916, @intFromPtr(&ifr)); // address
+    wle(u32, ifr[20..24], 0x00ffffff);
+    try io(sk, 0x891c, @intFromPtr(&ifr)); // netmask
     return tap;
 }
 
@@ -909,7 +974,10 @@ fn handle(cpu: *Vcpu) !void {
     switch (run.exit_reason) {
         EXIT_HLT, EXIT_INTR => {},
         EXIT_SHUTDOWN, EXIT_SYSTEM => vm.halt.store(true, .release),
-        EXIT_INTERNAL => vm.halt.store(true, .release),
+        EXIT_INTERNAL => {
+            log("vm{d}: KVM internal error {d}\n", .{ vm.id, le(u32, &run.un.pad) });
+            vm.halt.store(true, .release);
+        },
         EXIT_IO => {
             const io_ = run.un.io;
             const ptr = @as([*]u8, @ptrCast(run)) + io_.data_off;
@@ -917,6 +985,7 @@ fn handle(cpu: *Vcpu) !void {
             if (io_.dir == 0) @memset(slice, 0xff);
             if (io_.port >= 0x3f8 and io_.port < 0x400) {
                 for (0..io_.count) |i| vm.uart.io(io_.port, slice[i * io_.size ..][0..io_.size], io_.dir == 1, 1);
+                line(vm, 4, vm.uart.irq() != 1);
             } else if (io_.port == 0xcf8 or io_.port == 0xcfc) {
                 if (io_.dir == 0) @memset(slice, 0xff);
             } else if (io_.port == 0xcf9 and io_.dir == 1) {
@@ -937,7 +1006,10 @@ fn handle(cpu: *Vcpu) !void {
                 @memcpy(cpu.run.un.mmio.data[0..n], buf[0..n]);
             }
         },
-        else => {},
+        else => {
+            log("vm{d}: unexpected KVM exit {d}, detail 0x{x}\n", .{ vm.id, run.exit_reason, le(u64, &run.un.pad) });
+            vm.halt.store(true, .release);
+        },
     }
 }
 
@@ -950,14 +1022,20 @@ fn interrupt(_: linux.SIG) callconv(.c) void {
 fn runCpu(cpu: *Vcpu) void {
     active_run = cpu.run;
     defer cpu.vm.halt.store(true, .release);
-    sandbox() catch return;
+    sandbox() catch {
+        log("vm{d}: vCPU sandbox failed\n", .{cpu.vm.id});
+        return;
+    };
     while (true) {
         @as(*volatile u8, &cpu.run.immediate_exit).* = 0;
         if (cpu.vm.halt.load(.acquire)) break;
         const rc = linux.ioctl(cpu.fd, KVM_RUN, 0);
         const e = linux.errno(rc);
         if (e == .INTR) continue;
-        if (e != .SUCCESS) break;
+        if (e != .SUCCESS) {
+            log("vm{d}: KVM_RUN errno {d}\n", .{ cpu.vm.id, @intFromEnum(e) });
+            break;
+        }
         cpu.vm.lock.lock();
         handle(cpu) catch {};
         cpu.vm.lock.unlock();
@@ -968,6 +1046,7 @@ fn startVm(vm: *Vm) !void {
     if (vm.state == .on) return;
     if (vm.ncpu == 0 or vm.ncpu > MAX_CPU or vm.mem < 16 << 20 or vm.mem > RAM_MAX) return error.VmConfig;
     vm.halt.store(false, .release);
+    vm.gpa.free(vm.uart.cons);
     vm.uart = .{};
     vm.blk = .{ .kind = .blk, .base = BLK_BASE, .irq = 5 };
     vm.net = .{ .kind = .net, .base = NET_BASE, .irq = 6 };
@@ -982,7 +1061,7 @@ fn startVm(vm: *Vm) !void {
     }
     vm.uart.cons = try vm.gpa.alloc(u8, 1 << 16);
     vm.mac[5] = @truncate(vm.id);
-    if (vm.want_net) vm.tap = tapdev(vm.id, &vm.mac);
+    if (vm.want_net) vm.tap = try tapdev(vm.id, &vm.mac);
     vm.ram = try mmapAnon(@intCast(vm.mem));
     const bz = try mmapFile(vm.kernel);
     defer _ = linux.munmap(bz.ptr, bz.len);
@@ -1048,8 +1127,6 @@ fn stopVm(vm: *Vm) void {
     if (vm.tap >= 0) _ = linux.close(vm.tap);
     if (vm.ram.len != 0) _ = linux.munmap(vm.ram.ptr, vm.ram.len);
     vm.cow.deinit();
-    vm.gpa.free(vm.uart.cons);
-    vm.uart = .{};
     vm.ram = &.{};
     vm.fd = -1;
     vm.tap = -1;
@@ -1100,7 +1177,7 @@ fn kvz(a: std.mem.Allocator, b: []const u8, key: []const u8, dflt: [:0]const u8)
 }
 fn kvu(b: []const u8, key: []const u8, dflt: u32) u32 {
     const v = kv(b, key) orelse return dflt;
-    return std.fmt.parseInt(u32, v, 10) catch dflt;
+    return std.fmt.parseInt(u32, v, 10) catch std.math.maxInt(u32);
 }
 
 fn reply(cfd: i32, code: []const u8, body: []const u8) void {
@@ -1129,12 +1206,18 @@ fn requestLength(req: []const u8) !?usize {
 }
 
 fn vmJson(vm: *Vm, buf: []u8) []const u8 {
-    return std.fmt.bufPrint(buf, "{{\"id\":{d},\"state\":\"{s}\",\"cpus\":{d},\"mem_mb\":{d},\"snap\":{d}}}\n", .{
+    vm.lock.lock();
+    defer vm.lock.unlock();
+    return std.fmt.bufPrint(buf, "{{\"id\":{d},\"state\":\"{s}\",\"cpus\":{d},\"mem_mb\":{d},\"snap\":{d},\"net\":{s},\"grants\":{d},\"denied\":{d},\"console_cursor\":{d}}}\n", .{
         vm.id,
         @tagName(vm.state),
         vm.ncpu,
         vm.mem >> 20,
         vm.cow.gen,
+        if (vm.want_net) "true" else "false",
+        vm.policy.count,
+        vm.denied,
+        vm.uart.clen,
     }) catch "";
 }
 
@@ -1167,6 +1250,8 @@ fn route(cl: *Cloud, cfd: i32, req: []const u8) !void {
         return reply(cfd, "200 OK", out[0..n]);
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/vms")) {
+        const policy = try Policy.parse(kv(args, "allow") orelse "");
+        if (kvu(args, "net", 0) > 1) return error.VmConfig;
         if (kvu(args, "cpus", 1) == 0 or kvu(args, "cpus", 1) > MAX_CPU or kvu(args, "mem", 512) < 16 or kvu(args, "mem", 512) > RAM_MAX >> 20) return error.VmConfig;
         const slot = for (cl.used, 0..) |u, i| {
             if (!u) break i;
@@ -1187,7 +1272,8 @@ fn route(cl: *Cloud, cfd: i32, req: []const u8) !void {
             .initrd = try kvz(a, args, "initrd", ""),
             .extra = try kvz(a, args, "cmdline", ""),
             .overlay = try kvz(a, args, "overlay", ""),
-            .want_net = kvu(args, "net", 1) != 0,
+            .want_net = kvu(args, "net", 0) != 0 or policy.count != 0,
+            .policy = policy,
             .cow = .{ .gpa = cl.gpa },
         };
         vm.strings = arena;
@@ -1197,7 +1283,8 @@ fn route(cl: *Cloud, cfd: i32, req: []const u8) !void {
     }
 
     var rest = path;
-    if (std.mem.startsWith(u8, rest, "/vms/")) rest = rest["/vms/".len..];
+    if (!std.mem.startsWith(u8, rest, "/vms/")) return reply(cfd, "404 Not Found", "no\n");
+    rest = rest["/vms/".len..];
     const slash = std.mem.indexOfScalar(u8, rest, '/');
     const id_s = if (slash) |s| rest[0..s] else rest;
     const tail = if (slash) |s| rest[s + 1 ..] else "";
@@ -1212,7 +1299,34 @@ fn route(cl: *Cloud, cfd: i32, req: []const u8) !void {
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, tail, "console")) {
         vm.lock.lock();
         defer vm.lock.unlock();
-        return reply(cfd, "200 OK", vm.uart.cons[0..vm.uart.clen]);
+        const oldest = vm.uart.clen - @min(vm.uart.clen, vm.uart.cons.len);
+        const since = if (kv(qs, "since")) |s| try std.fmt.parseInt(usize, s, 10) else oldest;
+        if (since < oldest) return reply(cfd, "410 Gone", "console cursor expired\n");
+        if (since > vm.uart.clen) return error.Http;
+        var h: [192]u8 = undefined;
+        wr(cfd, try std.fmt.bufPrint(&h, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {d}\r\nX-Run-Cursor: {d}\r\nConnection: close\r\n\r\n", .{ vm.uart.clen - since, vm.uart.clen }));
+        if (since == vm.uart.clen) return;
+        const at = since % vm.uart.cons.len;
+        const chunk = @min(vm.uart.clen - since, vm.uart.cons.len - at);
+        wr(cfd, vm.uart.cons[at..][0..chunk]);
+        wr(cfd, vm.uart.cons[0 .. vm.uart.clen - since - chunk]);
+        return;
+    }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, tail, "console")) {
+        if (vm.state != .on) return reply(cfd, "409 Conflict", "VM is stopped\n");
+        vm.lock.lock();
+        defer vm.lock.unlock();
+        if (body.len > @as(usize, 255 - (vm.uart.w -% vm.uart.r))) return reply(cfd, "409 Conflict", "input queue full\n");
+        for (body) |c| vm.uart.put(c);
+        line(vm, 4, vm.uart.irq() != 1);
+        return reply(cfd, "200 OK", "accepted\n");
+    }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, tail, "permissions")) {
+        const policy = try Policy.parse(body);
+        vm.lock.lock();
+        vm.policy = policy;
+        vm.lock.unlock();
+        return reply(cfd, "200 OK", "updated\n");
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, tail, "start")) {
         startVm(vm) catch |e| return reply(cfd, "500 Internal Server Error", errorText(e));
@@ -1229,6 +1343,7 @@ fn route(cl: *Cloud, cfd: i32, req: []const u8) !void {
     }
     if (std.mem.eql(u8, method, "DELETE") and tail.len == 0) {
         stopVm(vm);
+        vm.gpa.free(vm.uart.cons);
         if (vm.strings) |*arena| arena.deinit();
         cl.used[id] = false;
         return reply(cfd, "200 OK", "gone\n");
@@ -1260,6 +1375,7 @@ fn usage() void {
         \\    --cmdline STR
         \\    --api PORT      (default 8080)
         \\    --no-net
+        \\    --allow RULES   comma-separated tcp|udp|icmp:IPv4/prefix:port grants
         \\
         \\  curl :8080/vms
         \\  curl -d 'kernel=bzImage&disk=root.img&cpus=2' localhost:8080/vms
@@ -1296,7 +1412,7 @@ fn serve(init: std.process.Init.Minimal) !void {
             config.kernel = a;
             continue;
         }
-        const option = std.meta.stringToEnum(enum { disk, initrd, overlay, cpus, mem, cmdline, api }, a[2..]) orelse return error.VmConfig;
+        const option = std.meta.stringToEnum(enum { disk, initrd, overlay, cpus, mem, cmdline, api, allow }, a[2..]) orelse return error.VmConfig;
         const value = args.next() orelse return error.VmConfig;
         switch (option) {
             .disk => config.disk = value,
@@ -1306,6 +1422,10 @@ fn serve(init: std.process.Init.Minimal) !void {
             .cpus => config.ncpu = try std.fmt.parseInt(u32, value, 10),
             .mem => config.mem = @as(u64, try std.fmt.parseInt(u32, value, 10)) << 20,
             .api => port = try std.fmt.parseInt(u16, value, 10),
+            .allow => {
+                config.policy = try Policy.parse(value);
+                config.want_net = true;
+            },
         }
     }
 
