@@ -1,0 +1,27 @@
+name: KVM
+on: [push, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Host prerequisites
+        run: |
+          test -c /dev/kvm
+          sudo apt-get update -qq
+          sudo apt-get install -y linux-image-virtual busybox-static cpio zstd
+          curl -fL https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz -o /tmp/zig.tar.xz
+          tar -C /tmp -xf /tmp/zig.tar.xz
+          echo /tmp/zig-x86_64-linux-0.16.0 >> "$GITHUB_PATH"
+      - name: Build and checked tests
+        run: zig build && zig build test
+      - name: Real KVM boot
+        run: sudo python3 tests/kvm.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kvm-evidence
+          path: evidence/

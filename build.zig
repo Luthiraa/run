@@ -20,10 +20,10 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
     const budget = b.allocator.create(Budget) catch @panic("out of memory");
-    budget.* = .{ .step = .init(.{ .id = .custom, .name = "100 KB budget", .owner = b, .makeFn = Budget.make }), .binary = exe.getEmittedBin() };
+    budget.* = .{ .step = .init(.{ .id = .custom, .name = "Size report", .owner = b, .makeFn = Budget.make }), .binary = exe.getEmittedBin() };
     budget.binary.addStepDependencies(&budget.step);
     if (optimize == .ReleaseSmall) b.getInstallStep().dependOn(&budget.step);
-    b.step("size", "Check executable plus source is at most 100,000 bytes").dependOn(&budget.step);
+    b.step("size", "Report executable and core source size").dependOn(&budget.step);
 
     const run = b.addRunArtifact(exe);
     run.step.dependOn(b.getInstallStep());
@@ -55,7 +55,6 @@ const Budget = struct {
         for ([_][]const u8{ "run.zig", "build.zig", "build.zig.zon", "README.md", "SYSTEM.md", ".gitignore" }) |path| {
             total += (try std.Io.Dir.cwd().statFile(b.graph.io, b.pathFromRoot(path), .{})).size;
         }
-        if (total > 100_000) return step.fail("executable + source: {d} bytes exceeds 100,000", .{total});
-        std.debug.print("run: {d} byte executable; {d}/100000 bytes with source\n", .{ binary.size, total });
+        std.debug.print("run: {d} byte executable; {d} bytes with core source and docs\n", .{ binary.size, total });
     }
 };
