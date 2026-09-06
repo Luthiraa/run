@@ -3,5 +3,5 @@
     .version = "0.1.0",
     .fingerprint = 0x5076a4c0301b3640,
     .minimum_zig_version = "0.16.0",
-    .paths = .{ "build.zig", "build.zig.zon", "run.zig", "README.md", "SYSTEM.md", ".gitignore" },
+    .paths = .{ "build.zig", "build.zig.zon", "run.zig", "README.md", "SYSTEM.md", ".gitignore", "tools", "tests", ".github", "docs" },
 }

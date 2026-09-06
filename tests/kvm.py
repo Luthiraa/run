@@ -142,10 +142,11 @@ exec setsid cttyhack sh
                 assert result == {"stdout": "from_agent", "exit_code": 7}, result
                 result = execute("http://127.0.0.1:18080", 0, "wget -T 3 -qO- http://198.18.0.2:18081/proof")
                 assert result["exit_code"] == 0 and "RUN_NETWORK_OK" in result["stdout"], result
+                denied = json.loads(request("/vms/0"))["denied"]
                 request("/vms/0/permissions", "POST", b"")
                 result = execute("http://127.0.0.1:18080", 0, "wget -T 2 -qO- http://198.18.0.2:18081/proof")
                 assert result["exit_code"] != 0, "revoked network access still succeeded"
-                assert json.loads(request("/vms/0"))["denied"] > 0
+                assert json.loads(request("/vms/0"))["denied"] > denied
                 result = execute("http://127.0.0.1:18080", 0, "echo agent-persist >/disk/agent; sync; umount /disk")
                 assert result["exit_code"] == 0, result
                 request("/vms/0/snap", "POST")
@@ -171,7 +172,7 @@ exec setsid cttyhack sh
                 assert hashlib.sha256(disk.read_bytes()).hexdigest() == before
                 (EVIDENCE / "result.json").write_text(json.dumps({"commit": sp.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(), "kernel": version, "kernel_sha256": hashlib.sha256(kernel.read_bytes()).hexdigest(), "binary_bytes": (REPO / "zig-out/bin/run").stat().st_size, "binary_sha256": hashlib.sha256((REPO / "zig-out/bin/run").read_bytes()).hexdigest(), "boot_seconds": boot_seconds, "smp": 2, "private_disk": True, "checkpoint_restore": True, "agent_exit_code": True, "routed_network": True, "revocation": True}, indent=2) + "\n")
             finally:
-                command("sh", str(REPO / "tools/egress.sh"), "down", "0", uplink)
+                sp.run(["sh", str(REPO / "tools/egress.sh"), "down", "0", uplink], check=False)
                 vm.terminate()
                 try:
                     vm.wait(timeout=5)
